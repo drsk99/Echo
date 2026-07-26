@@ -1,4 +1,7 @@
 """
+SPDX-License-Identifier: Apache-2.0
+Copyright 2026 drsk99
+
 Single-file voice assistant.
 Browser mic -> WebSocket -> faster-whisper STT -> llama-swap (OpenAI-compatible) -> piper TTS -> back to browser.
 

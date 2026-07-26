@@ -58,4 +58,4 @@ pip install fastapi "uvicorn[standard]" faster-whisper openai websockets
 
 ## License
 
-No license specified — personal project, all rights reserved.
+Licensed under the [Apache License 2.0](LICENSE).
