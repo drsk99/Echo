@@ -34,10 +34,16 @@ If `transcribe()` returns empty text (e.g. background noise with no speech), the
 `{"type": "error", "message": "no speech detected"}` and waits for the next utterance instead of
 calling the LLM.
 
+The reply is split into sentences (`split_sentences()`) and synthesized/sent one sentence at a
+time, rather than as a single `reply_audio` message for the whole reply. This lets the client
+start playing the first sentence while piper is still synthesizing later ones, instead of waiting
+on the full reply before any audio arrives.
+
 ## WebSocket message protocol
 
 **Client → server:** a single binary WebM/Opus blob per utterance (one message per turn, not a
-continuous stream).
+continuous stream). If `AUTH_TOKEN` is set, the connection URL must include `?token=<value>` or
+the server closes it (code `4401`) before accepting.
 
 **Server → client:** JSON text messages, in this order per turn:
 
@@ -45,7 +51,7 @@ continuous stream).
 |---|---|---|
 | `transcript` | `text` | What Whisper heard. |
 | `reply_text` | `text` | The LLM's reply, before speech synthesis. |
-| `reply_audio` | `audio_b64` | Base64-encoded WAV of the spoken reply. |
+| `reply_audio` | `audio_b64`, `final` | Base64-encoded WAV of one sentence of the spoken reply; sent once per sentence. `final` is `true` on the last chunk of the turn. |
 | `error` | `message` | Something recoverable went wrong (e.g. no speech detected); the turn ends without a reply. |
 
 ## Frontend
@@ -75,10 +81,22 @@ executor (`loop.run_in_executor`) so they don't block the asyncio event loop whi
 subprocess runs:
 
 - `transcribe(audio_bytes)` — writes the blob to a temp file and runs it through the
-  `faster_whisper.WhisperModel` loaded at startup.
+  `faster_whisper.WhisperModel` loaded at startup. The temp file is always removed afterward
+  (`finally`), including when transcription itself raises. The actual `stt_model.transcribe()`
+  call is serialized with `stt_lock`, since concurrent calls into the same model instance from
+  multiple executor threads aren't documented as safe by faster-whisper/ctranslate2.
 - `query_llm(text)` — a single non-streaming chat completion call against `LLAMA_SWAP_URL`.
 - `synthesize(text)` — pipes text into the `piper` binary as a subprocess and wraps its raw PCM
-  output in a WAV container.
+  output in a WAV container at `PIPER_SAMPLE_RATE`. A `CalledProcessError` (piper ran but failed)
+  is logged with piper's stderr before being re-raised, so the operator can see *why* piper failed
+  rather than just that it did.
 
 The Whisper model and the OpenAI client are constructed once at import time (`stt_model`,
 `llm_client`), not per-request.
+
+## Access control
+
+There's no user accounts or session model — just an optional shared secret (`AUTH_TOKEN`). When
+set, `_check_auth()` gates both `GET /` (401 without a valid `?token=`) and `/ws` (closed with
+code `4401` before `accept()`). This is meant for a private network (e.g. a tailnet) where you
+want a lightweight gate against anyone else on that network, not for internet-facing deployment.

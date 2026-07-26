@@ -35,6 +35,8 @@ All configuration lives in one block near the top of the file:
 | `WHISPER_CPU_MODEL_SIZE` / `WHISPER_CPU_DEVICE` / `WHISPER_CPU_COMPUTE_TYPE` | Whisper settings used when `USE_GPU = False`. Defaults: `small` / `cpu` / `int8` — `medium`/`large` are too slow for real-time use on CPU. |
 | `PIPER_BIN` | Path to the piper binary. |
 | `PIPER_MODEL` | Path to the piper voice `.onnx` model. |
+| `PIPER_SAMPLE_RATE` | Sample rate to wrap piper's raw PCM output in a WAV container at. Must match the voice model's actual rate (check its `.onnx.json`) or audio plays back pitched/sped wrong. Defaults to `22050`, correct for most piper voices. |
+| `AUTH_TOKEN` | Optional shared secret. Empty (default) means anyone who can reach `HOST:PORT` can use the app — fine on a private tailnet, not on an open network. When set, both the page and the WebSocket require `?token=<value>` in the URL; the page passes its own token through to the WebSocket automatically. |
 | `HOST` / `PORT` | Bind address for the FastAPI server. Defaults to `0.0.0.0:8000` so it's reachable from other devices on your network. |
 
 Only the variable *names* are fixed — every value is yours to change; there's no separate config

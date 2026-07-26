@@ -18,13 +18,15 @@ import asyncio
 import base64
 import io
 import logging
+import re
 import subprocess
 import tempfile
+import threading
 import wave
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from faster_whisper import WhisperModel
 from openai import OpenAI
@@ -32,6 +34,11 @@ from openai import OpenAI
 # ---- config ----
 LLAMA_SWAP_URL = "http://localhost:8080/v1"   # your llama-swap endpoint
 LLAMA_SWAP_MODEL = "your-model-name"          # model name as configured in llama-swap
+
+# Shared secret required to use the app — leave empty to allow anyone who can reach HOST:PORT
+# (fine on a private tailnet, not fine on an open network). When set, clients must pass it as
+# ?token=... on both the page URL and the WebSocket URL.
+AUTH_TOKEN = ""
 
 # Whisper STT hardware profile — flip this to match whatever machine you're running on.
 USE_GPU = True
@@ -50,6 +57,7 @@ WHISPER_COMPUTE_TYPE = WHISPER_GPU_COMPUTE_TYPE if USE_GPU else WHISPER_CPU_COMP
 
 PIPER_BIN = "/usr/local/bin/piper"
 PIPER_MODEL = "/opt/piper/en_US-lessac-medium.onnx"
+PIPER_SAMPLE_RATE = 22050   # must match your voice model's .onnx.json "sample_rate", or audio is pitched wrong
 HOST = "0.0.0.0"
 PORT = 8000
 # ----------------
@@ -58,19 +66,40 @@ app = FastAPI()
 stt_model = WhisperModel(WHISPER_MODEL_SIZE, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)
 llm_client = OpenAI(base_url=LLAMA_SWAP_URL, api_key="not-needed")
 
+# faster-whisper/ctranslate2 doesn't document the shared WhisperModel instance as safe for
+# concurrent .transcribe() calls from multiple threads, and the WS handler runs each call in a
+# shared executor thread pool — serialize access rather than risk corrupted/interleaved results.
+stt_lock = threading.Lock()
+
 SYSTEM_PROMPT = "You are a concise voice assistant. Keep replies short — this will be read aloud."
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def split_sentences(text: str) -> list[str]:
+    """Splits a reply into sentence-sized chunks so TTS/playback can start before the whole
+    reply is synthesized, instead of waiting on piper for the entire (possibly long) reply."""
+    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(text) if p.strip()]
+    return parts or [text]
+
+
+def _check_auth(token: str | None) -> bool:
+    return not AUTH_TOKEN or token == AUTH_TOKEN
 
 
 def transcribe(audio_bytes: bytes) -> str:
     with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
         f.write(audio_bytes)
         path = f.name
-    # vad_filter matters more than it looks: without it, Whisper routinely hallucinates a
-    # short word ("You", "Thank you") on pure silence instead of returning empty text, which
-    # would otherwise send every silent clip to the LLM as if it were real speech.
-    segments, _ = stt_model.transcribe(path, language="en", vad_filter=True)
-    Path(path).unlink(missing_ok=True)
-    return " ".join(seg.text.strip() for seg in segments).strip()
+    try:
+        # vad_filter matters more than it looks: without it, Whisper routinely hallucinates a
+        # short word ("You", "Thank you") on pure silence instead of returning empty text, which
+        # would otherwise send every silent clip to the LLM as if it were real speech.
+        with stt_lock:
+            segments, _ = stt_model.transcribe(path, language="en", vad_filter=True)
+        return " ".join(seg.text.strip() for seg in segments).strip()
+    finally:
+        Path(path).unlink(missing_ok=True)
 
 
 def query_llm(text: str) -> str:
@@ -86,24 +115,33 @@ def query_llm(text: str) -> str:
 
 def synthesize(text: str) -> bytes:
     """Runs piper, returns raw WAV bytes."""
-    result = subprocess.run(
-        [PIPER_BIN, "--model", PIPER_MODEL, "--output-raw"],
-        input=text.encode("utf-8"),
-        capture_output=True,
-        check=True,
-    )
-    pcm = result.stdout  # raw 16-bit mono PCM at piper's sample rate (usually 22050)
+    try:
+        result = subprocess.run(
+            [PIPER_BIN, "--model", PIPER_MODEL, "--output-raw"],
+            input=text.encode("utf-8"),
+            capture_output=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        # check=True's own message just says "exited with code N" — log piper's stderr too,
+        # since that's what actually tells you it's a bad model path or malformed input.
+        logging.error("piper exited with %s: %s", e.returncode, e.stderr.decode(errors="replace").strip())
+        raise
+    pcm = result.stdout  # raw 16-bit mono PCM at PIPER_SAMPLE_RATE
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
-        wf.setframerate(22050)
+        wf.setframerate(PIPER_SAMPLE_RATE)
         wf.writeframes(pcm)
     return buf.getvalue()
 
 
 @app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket):
+async def ws_endpoint(ws: WebSocket, token: str | None = Query(None)):
+    if not _check_auth(token):
+        await ws.close(code=4401)
+        return
     await ws.accept()
     try:
         while True:
@@ -136,23 +174,30 @@ async def ws_endpoint(ws: WebSocket):
 
             await ws.send_json({"type": "reply_text", "text": reply})
 
+            # Synthesize and send sentence-by-sentence rather than the whole reply at once, so
+            # playback of the first sentence can start while later sentences are still being
+            # synthesized, instead of the client waiting on piper for the entire reply.
             try:
-                wav_bytes = await loop.run_in_executor(None, synthesize, reply)
+                sentences = split_sentences(reply)
+                for i, sentence in enumerate(sentences):
+                    wav_bytes = await loop.run_in_executor(None, synthesize, sentence)
+                    await ws.send_json({
+                        "type": "reply_audio",
+                        "audio_b64": base64.b64encode(wav_bytes).decode("ascii"),
+                        "final": i == len(sentences) - 1,
+                    })
             except Exception:
                 logging.exception("TTS failed")
                 await ws.send_json({"type": "error", "message": "text-to-speech failed"})
                 continue
-
-            await ws.send_json({
-                "type": "reply_audio",
-                "audio_b64": base64.b64encode(wav_bytes).decode("ascii"),
-            })
     except WebSocketDisconnect:
         pass
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
+async def index(token: str | None = None):
+    if not _check_auth(token):
+        return HTMLResponse("Unauthorized", status_code=401)
     return """
 <!DOCTYPE html>
 <html>
@@ -376,7 +421,9 @@ function setStatus(text, isError = false) {
 }
 
 function connect() {
-  ws = new WebSocket(`ws://${location.host}/ws`);
+  const token = new URLSearchParams(location.search).get("token");
+  const qs = token ? `?token=${encodeURIComponent(token)}` : "";
+  ws = new WebSocket(`ws://${location.host}/ws${qs}`);
   ws.onopen = () => { setStatus(mode === "push" ? "ready" : "listening…"); };
   ws.onclose = () => { setStatus("disconnected — reconnecting…", true); setTimeout(connect, 1500); };
   ws.onmessage = (event) => {
@@ -391,21 +438,42 @@ function connect() {
       replyEl.textContent = msg.text;
     }
     if (msg.type === "reply_audio") {
-      player.src = "data:audio/wav;base64," + msg.audio_b64;
-      setOrb("speaking");
-      setStatus("speaking…");
-      player.play();
-      player.onended = () => {
-        busy = false;
-        setOrb(mode === "continuous" ? "listening" : "");
-        setStatus(mode === "continuous" ? "listening…" : "ready");
-      };
+      enqueueAudio(msg.audio_b64, msg.final !== false);
     }
     if (msg.type === "error") {
       busy = false;
+      audioQueue = [];
       setStatus(msg.message, true);
       setOrb(mode === "continuous" ? "listening" : "");
     }
+  };
+}
+
+// Replies may arrive as several sentence-sized audio chunks in sequence (see server-side
+// split_sentences) — queue them so playback is gapless instead of racing player.src reassignment.
+let audioQueue = [];
+let playingQueue = false;
+
+function enqueueAudio(audioB64, isFinal) {
+  audioQueue.push({ audioB64, isFinal });
+  if (!playingQueue) playNextInQueue();
+}
+
+function playNextInQueue() {
+  if (audioQueue.length === 0) { playingQueue = false; return; }
+  playingQueue = true;
+  const { audioB64, isFinal } = audioQueue.shift();
+  player.src = "data:audio/wav;base64," + audioB64;
+  setOrb("speaking");
+  setStatus("speaking…");
+  player.play();
+  player.onended = () => {
+    if (isFinal) {
+      busy = false;
+      setOrb(mode === "continuous" ? "listening" : "");
+      setStatus(mode === "continuous" ? "listening…" : "ready");
+    }
+    playNextInQueue();
   };
 }
 

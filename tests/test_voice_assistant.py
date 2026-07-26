@@ -144,7 +144,7 @@ def test_happy_path(load_app):
 def test_synthesize_wraps_pcm_in_valid_wav(load_app):
     """Validates the WAV-wrapping logic itself; doesn't check against real piper output
     (unavailable in this environment) — see docs/SETUP.md for the sample-rate caveat that
-    implies (PIPER_MODEL's actual sample rate isn't verified against the hardcoded 22050)."""
+    implies (PIPER_MODEL's actual sample rate isn't verified against PIPER_SAMPLE_RATE)."""
     va = load_app(use_gpu=False)
     import io
     import subprocess
@@ -157,4 +157,102 @@ def test_synthesize_wraps_pcm_in_valid_wav(load_app):
     with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
         assert wf.getnchannels() == 1
         assert wf.getsampwidth() == 2
+        assert wf.getframerate() == va.PIPER_SAMPLE_RATE
         assert wf.readframes(wf.getnframes()) == fake_pcm
+
+
+def test_synthesize_logs_and_reraises_on_piper_process_error(load_app):
+    va = load_app(use_gpu=False)
+    import subprocess
+
+    err = subprocess.CalledProcessError(1, ["piper"], output=b"", stderr=b"model not found")
+    with patch.object(subprocess, "run", side_effect=err):
+        with pytest.raises(subprocess.CalledProcessError):
+            va.synthesize("hello")
+
+
+def test_piper_process_error_surfaces_as_tts_error_over_ws(load_app):
+    va = load_app(use_gpu=False)
+    import subprocess
+
+    client = TestClient(va.app)
+    fake_completion = MagicMock()
+    fake_completion.choices = [MagicMock(message=MagicMock(content="a reply"))]
+    err = subprocess.CalledProcessError(1, ["piper"], output=b"", stderr=b"model not found")
+    with patch.object(va.llm_client.chat.completions, "create", return_value=fake_completion), \
+         patch.object(subprocess, "run", side_effect=err):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_bytes(b"fake-audio")
+            ws.receive_json()  # transcript
+            ws.receive_json()  # reply_text
+            error_msg = ws.receive_json()
+
+    assert error_msg == {"type": "error", "message": "text-to-speech failed"}
+
+
+def test_stt_failure_cleans_up_temp_file(load_app):
+    """Regression test: transcribe() used to skip Path(path).unlink() entirely when
+    stt_model.transcribe() raised, leaking a temp .webm file per failed transcription."""
+    va = load_app(use_gpu=False)
+    import glob
+    import tempfile as _tempfile
+
+    pattern = str(Path(_tempfile.gettempdir()) / "*.webm")
+    before = set(glob.glob(pattern))
+    with patch.object(va.stt_model, "transcribe", side_effect=RuntimeError("boom")):
+        with pytest.raises(RuntimeError):
+            va.transcribe(b"fake-audio")
+    after = set(glob.glob(pattern))
+
+    assert after == before
+
+
+def test_multi_sentence_reply_sends_one_audio_chunk_per_sentence(load_app):
+    va = load_app(use_gpu=False)
+    client = TestClient(va.app)
+    fake_completion = MagicMock()
+    fake_completion.choices = [MagicMock(message=MagicMock(content="First sentence. Second sentence."))]
+    with patch.object(va.llm_client.chat.completions, "create", return_value=fake_completion), \
+         patch.object(va, "synthesize", return_value=b"RIFFxxxxWAVEfmt "):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_bytes(b"fake-audio")
+            msgs = [ws.receive_json() for _ in range(4)]  # transcript, reply_text, 2x reply_audio
+
+    audio_msgs = [m for m in msgs if m["type"] == "reply_audio"]
+    assert len(audio_msgs) == 2
+    assert [m["final"] for m in audio_msgs] == [False, True]
+
+
+def test_index_requires_token_when_auth_configured(load_app):
+    va = load_app(use_gpu=False)
+    va.AUTH_TOKEN = "secret"
+    client = TestClient(va.app)
+
+    assert client.get("/").status_code == 401
+    assert client.get("/?token=wrong").status_code == 401
+    assert client.get("/?token=secret").status_code == 200
+
+
+def test_ws_rejects_missing_or_wrong_token_when_auth_configured(load_app):
+    va = load_app(use_gpu=False)
+    va.AUTH_TOKEN = "secret"
+    client = TestClient(va.app)
+
+    with pytest.raises(Exception):
+        with client.websocket_connect("/ws"):
+            pass
+    with pytest.raises(Exception):
+        with client.websocket_connect("/ws?token=wrong"):
+            pass
+
+
+def test_ws_accepts_correct_token_when_auth_configured(load_app):
+    va = load_app(use_gpu=False)
+    va.AUTH_TOKEN = "secret"
+    client = TestClient(va.app)
+
+    with client.websocket_connect("/ws?token=secret") as ws:
+        ws.send_bytes(b"fake-audio")
+        msg = ws.receive_json()
+
+    assert msg == {"type": "transcript", "text": "hello world"}

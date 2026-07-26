@@ -57,11 +57,11 @@ not (and can't, without a GPU) verify that ctranslate2 actually runs on one.
 
 ## Known gaps testing didn't cover
 
-- **Piper's actual sample rate.** `synthesize()` hardcodes `wf.setframerate(22050)` when wrapping
-  piper's raw PCM output. Most piper voices are 22050 Hz, but it varies by voice model (check the
-  voice's `.onnx.json` for its `sample_rate`) — a mismatched value won't error, it'll just play
-  back at the wrong pitch/speed. No piper binary is available in this environment to verify
-  against real output; if you hear pitched audio, check this first.
+- **Piper's actual sample rate.** `synthesize()` wraps piper's raw PCM output at
+  `PIPER_SAMPLE_RATE` (configurable, default `22050`). Most piper voices are 22050 Hz, but it
+  varies by voice model (check the voice's `.onnx.json` for its `sample_rate`) — a mismatched
+  value won't error, it'll just play back at the wrong pitch/speed. No piper binary is available
+  in this environment to verify against real output; if you hear pitched audio, check this first.
 - **Whisper transcription accuracy on real speech.** All tests here use synthetic (silent or
   tone) audio — there's no real speech sample in this environment to validate transcription
   quality against, only that the pipeline mechanically works.
