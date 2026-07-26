@@ -11,10 +11,19 @@ Browser mic → WebSocket → faster-whisper (STT) → llama-swap (OpenAI-compat
 
 - **Push-to-talk or continuous mode** — hold a button, or let client-side voice-activity detection
   start/stop recording for you.
+- **Type instead of speaking** — a text input alongside the mic for when talking isn't convenient.
+- **Conversation memory** — recent turns are sent back to the LLM as context, so replies can refer
+  to what you just said (configurable window, or disable for fully stateless turns).
+- **Personas** — switch the assistant's system prompt (and start a fresh conversation) from a
+  dropdown, no restart required.
+- **Barge-in** — start talking (or typing) while the assistant is still replying and it stops
+  immediately instead of finishing its sentence.
 - **Live status visualization** — an animated node network reflects idle / listening / thinking /
   speaking state in real time.
 - **CPU/GPU toggle** — flip one flag to switch the Whisper model between a CUDA and a CPU profile;
   no separate config files to maintain.
+- **Optional access token** — gate the app behind a shared secret when it's reachable by more than
+  just you.
 - **Clean, accessible UI** — keyboard-operable controls, screen-reader-friendly status updates,
   clear error states (denied mic permission, unsupported browser, dropped connection).
 - **Zero build step** — one Python file serves both the API and the entire frontend.
@@ -49,4 +58,4 @@ pip install fastapi "uvicorn[standard]" faster-whisper openai websockets
 
 ## License
 
-No license specified — personal project, all rights reserved.
+Licensed under the [Apache License 2.0](LICENSE).

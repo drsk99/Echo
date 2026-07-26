@@ -8,7 +8,9 @@ endpoint. For a real (slow) end-to-end CPU run, see test_integration_cpu.py inst
 
 Run with: pytest tests/test_voice_assistant.py
 """
+import json
 import sys
+import threading
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -144,7 +146,7 @@ def test_happy_path(load_app):
 def test_synthesize_wraps_pcm_in_valid_wav(load_app):
     """Validates the WAV-wrapping logic itself; doesn't check against real piper output
     (unavailable in this environment) — see docs/SETUP.md for the sample-rate caveat that
-    implies (PIPER_MODEL's actual sample rate isn't verified against the hardcoded 22050)."""
+    implies (PIPER_MODEL's actual sample rate isn't verified against PIPER_SAMPLE_RATE)."""
     va = load_app(use_gpu=False)
     import io
     import subprocess
@@ -157,4 +159,254 @@ def test_synthesize_wraps_pcm_in_valid_wav(load_app):
     with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
         assert wf.getnchannels() == 1
         assert wf.getsampwidth() == 2
+        assert wf.getframerate() == va.PIPER_SAMPLE_RATE
         assert wf.readframes(wf.getnframes()) == fake_pcm
+
+
+def test_synthesize_logs_and_reraises_on_piper_process_error(load_app):
+    va = load_app(use_gpu=False)
+    import subprocess
+
+    err = subprocess.CalledProcessError(1, ["piper"], output=b"", stderr=b"model not found")
+    with patch.object(subprocess, "run", side_effect=err):
+        with pytest.raises(subprocess.CalledProcessError):
+            va.synthesize("hello")
+
+
+def test_piper_process_error_surfaces_as_tts_error_over_ws(load_app):
+    va = load_app(use_gpu=False)
+    import subprocess
+
+    client = TestClient(va.app)
+    fake_completion = MagicMock()
+    fake_completion.choices = [MagicMock(message=MagicMock(content="a reply"))]
+    err = subprocess.CalledProcessError(1, ["piper"], output=b"", stderr=b"model not found")
+    with patch.object(va.llm_client.chat.completions, "create", return_value=fake_completion), \
+         patch.object(subprocess, "run", side_effect=err):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_bytes(b"fake-audio")
+            ws.receive_json()  # transcript
+            ws.receive_json()  # reply_text
+            error_msg = ws.receive_json()
+
+    assert error_msg == {"type": "error", "message": "text-to-speech failed"}
+
+
+def test_stt_failure_cleans_up_temp_file(load_app):
+    """Regression test: transcribe() used to skip Path(path).unlink() entirely when
+    stt_model.transcribe() raised, leaking a temp .webm file per failed transcription."""
+    va = load_app(use_gpu=False)
+    import glob
+    import tempfile as _tempfile
+
+    pattern = str(Path(_tempfile.gettempdir()) / "*.webm")
+    before = set(glob.glob(pattern))
+    with patch.object(va.stt_model, "transcribe", side_effect=RuntimeError("boom")):
+        with pytest.raises(RuntimeError):
+            va.transcribe(b"fake-audio")
+    after = set(glob.glob(pattern))
+
+    assert after == before
+
+
+def test_multi_sentence_reply_sends_one_audio_chunk_per_sentence(load_app):
+    va = load_app(use_gpu=False)
+    client = TestClient(va.app)
+    fake_completion = MagicMock()
+    fake_completion.choices = [MagicMock(message=MagicMock(content="First sentence. Second sentence."))]
+    with patch.object(va.llm_client.chat.completions, "create", return_value=fake_completion), \
+         patch.object(va, "synthesize", return_value=b"RIFFxxxxWAVEfmt "):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_bytes(b"fake-audio")
+            msgs = [ws.receive_json() for _ in range(4)]  # transcript, reply_text, 2x reply_audio
+
+    audio_msgs = [m for m in msgs if m["type"] == "reply_audio"]
+    assert len(audio_msgs) == 2
+    assert [m["final"] for m in audio_msgs] == [False, True]
+
+
+def test_index_requires_token_when_auth_configured(load_app):
+    va = load_app(use_gpu=False)
+    va.AUTH_TOKEN = "secret"
+    client = TestClient(va.app)
+
+    assert client.get("/").status_code == 401
+    assert client.get("/?token=wrong").status_code == 401
+    assert client.get("/?token=secret").status_code == 200
+
+
+def test_ws_rejects_missing_or_wrong_token_when_auth_configured(load_app):
+    va = load_app(use_gpu=False)
+    va.AUTH_TOKEN = "secret"
+    client = TestClient(va.app)
+
+    with pytest.raises(Exception):
+        with client.websocket_connect("/ws"):
+            pass
+    with pytest.raises(Exception):
+        with client.websocket_connect("/ws?token=wrong"):
+            pass
+
+
+def test_ws_accepts_correct_token_when_auth_configured(load_app):
+    va = load_app(use_gpu=False)
+    va.AUTH_TOKEN = "secret"
+    client = TestClient(va.app)
+
+    with client.websocket_connect("/ws?token=secret") as ws:
+        ws.send_bytes(b"fake-audio")
+        msg = ws.receive_json()
+
+    assert msg == {"type": "transcript", "text": "hello world"}
+
+
+# ---- conversation memory ----
+
+def test_conversation_history_is_sent_back_to_the_llm(load_app):
+    va = load_app(use_gpu=False)
+    client = TestClient(va.app)
+    calls = []
+
+    def fake_create(model, messages):
+        calls.append(messages)
+        completion = MagicMock()
+        completion.choices = [MagicMock(message=MagicMock(content=f"reply {len(calls)}"))]
+        return completion
+
+    with patch.object(va.llm_client.chat.completions, "create", side_effect=fake_create), \
+         patch.object(va, "synthesize", return_value=b"RIFFxxxxWAVEfmt "):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_bytes(b"fake-audio")
+            [ws.receive_json() for _ in range(3)]  # transcript, reply_text, reply_audio
+            ws.send_bytes(b"fake-audio")
+            [ws.receive_json() for _ in range(3)]
+
+    assert calls[0] == [
+        {"role": "system", "content": va.PERSONAS[va.DEFAULT_PERSONA]},
+        {"role": "user", "content": "hello world"},
+    ]
+    assert calls[1] == [
+        {"role": "system", "content": va.PERSONAS[va.DEFAULT_PERSONA]},
+        {"role": "user", "content": "hello world"},
+        {"role": "assistant", "content": "reply 1"},
+        {"role": "user", "content": "hello world"},
+    ]
+
+
+# ---- text input fallback ----
+
+def test_text_input_skips_stt_and_reaches_the_llm(load_app):
+    va = load_app(use_gpu=False)
+    client = TestClient(va.app)
+    fake_completion = MagicMock()
+    fake_completion.choices = [MagicMock(message=MagicMock(content="a reply"))]
+    with patch.object(va.llm_client.chat.completions, "create", return_value=fake_completion), \
+         patch.object(va, "synthesize", return_value=b"RIFFxxxxWAVEfmt "), \
+         patch.object(va, "transcribe") as mock_transcribe:
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "text_input", "text": "typed question"}))
+            transcript_msg = ws.receive_json()
+            reply_msg = ws.receive_json()
+
+    mock_transcribe.assert_not_called()
+    assert transcript_msg == {"type": "transcript", "text": "typed question"}
+    assert reply_msg == {"type": "reply_text", "text": "a reply"}
+
+
+def test_blank_text_input_is_ignored(load_app):
+    va = load_app(use_gpu=False)
+    client = TestClient(va.app)
+    fake_completion = MagicMock()
+    fake_completion.choices = [MagicMock(message=MagicMock(content="a reply"))]
+    with patch.object(va.llm_client.chat.completions, "create", return_value=fake_completion), \
+         patch.object(va, "synthesize", return_value=b"RIFFxxxxWAVEfmt "):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "text_input", "text": "   "}))
+            ws.send_bytes(b"fake-audio")
+            msg = ws.receive_json()  # the blank text_input produced nothing; this is the audio turn
+
+    assert msg == {"type": "transcript", "text": "hello world"}
+
+
+# ---- persona switching ----
+
+def test_set_persona_changes_system_prompt_and_resets_history(load_app):
+    va = load_app(use_gpu=False)
+    client = TestClient(va.app)
+    calls = []
+
+    def fake_create(model, messages):
+        calls.append(messages)
+        completion = MagicMock()
+        completion.choices = [MagicMock(message=MagicMock(content="arr"))]
+        return completion
+
+    with patch.object(va.llm_client.chat.completions, "create", side_effect=fake_create), \
+         patch.object(va, "synthesize", return_value=b"RIFFxxxxWAVEfmt "):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "set_persona", "persona": "pirate"}))
+            ack = ws.receive_json()
+            ws.send_bytes(b"fake-audio")
+            [ws.receive_json() for _ in range(3)]
+
+    assert ack == {"type": "persona_set", "persona": "pirate"}
+    assert calls[0][0] == {"role": "system", "content": va.PERSONAS["pirate"]}
+
+
+def test_unknown_persona_is_rejected(load_app):
+    va = load_app(use_gpu=False)
+    client = TestClient(va.app)
+    with client.websocket_connect("/ws") as ws:
+        ws.send_text(json.dumps({"type": "set_persona", "persona": "nonexistent"}))
+        ws.send_bytes(b"fake-audio")
+        msg = ws.receive_json()  # the rejected persona switch produced nothing; this is the audio turn
+
+    assert msg == {"type": "transcript", "text": "hello world"}
+
+
+# ---- rate limiting ----
+
+def test_rate_limit_blocks_excess_turns(load_app):
+    va = load_app(use_gpu=False)
+    va.RATE_LIMIT_TURNS_PER_MINUTE = 1
+    client = TestClient(va.app)
+    fake_completion = MagicMock()
+    fake_completion.choices = [MagicMock(message=MagicMock(content="a reply"))]
+    with patch.object(va.llm_client.chat.completions, "create", return_value=fake_completion), \
+         patch.object(va, "synthesize", return_value=b"RIFFxxxxWAVEfmt "):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_bytes(b"fake-audio")
+            [ws.receive_json() for _ in range(3)]  # transcript, reply_text, reply_audio
+            ws.send_bytes(b"fake-audio")
+            second_msg = ws.receive_json()
+
+    assert second_msg == {"type": "error", "message": "rate limit exceeded — slow down"}
+
+
+# ---- interrupt / barge-in ----
+
+def test_new_utterance_interrupts_in_flight_turn(load_app):
+    va = load_app(use_gpu=False)
+    client = TestClient(va.app)
+    release = threading.Event()
+
+    def slow_create(model, messages):
+        release.wait(timeout=5)
+        completion = MagicMock()
+        completion.choices = [MagicMock(message=MagicMock(content="reply"))]
+        return completion
+
+    with patch.object(va.llm_client.chat.completions, "create", side_effect=slow_create), \
+         patch.object(va, "synthesize", return_value=b"RIFFxxxxWAVEfmt "):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_bytes(b"fake-audio")
+            first_transcript = ws.receive_json()  # first turn now blocked inside query_llm
+
+            ws.send_bytes(b"fake-audio")
+            interrupted_msg = ws.receive_json()
+            release.set()  # let the (now cancelled) first LLM call's background thread finish
+            second_transcript = ws.receive_json()
+
+    assert first_transcript == {"type": "transcript", "text": "hello world"}
+    assert interrupted_msg == {"type": "interrupted"}
+    assert second_transcript == {"type": "transcript", "text": "hello world"}
