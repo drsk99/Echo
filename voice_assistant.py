@@ -17,6 +17,7 @@ Then open http://<tailscale-hostname>:8000 from any device on your tailnet.
 import asyncio
 import base64
 import io
+import logging
 import subprocess
 import tempfile
 import wave
@@ -64,7 +65,10 @@ def transcribe(audio_bytes: bytes) -> str:
     with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
         f.write(audio_bytes)
         path = f.name
-    segments, _ = stt_model.transcribe(path, language="en")
+    # vad_filter matters more than it looks: without it, Whisper routinely hallucinates a
+    # short word ("You", "Thank you") on pure silence instead of returning empty text, which
+    # would otherwise send every silent clip to the LLM as if it were real speech.
+    segments, _ = stt_model.transcribe(path, language="en", vad_filter=True)
     Path(path).unlink(missing_ok=True)
     return " ".join(seg.text.strip() for seg in segments).strip()
 
@@ -104,19 +108,41 @@ async def ws_endpoint(ws: WebSocket):
     try:
         while True:
             audio_bytes = await ws.receive_bytes()
-
             loop = asyncio.get_event_loop()
-            text = await loop.run_in_executor(None, transcribe, audio_bytes)
+
+            # Each stage is wrapped separately so a downstream outage (LLM unreachable, piper
+            # missing, a bad model file) sends the client a specific, recoverable error message
+            # instead of raising out of the handler and silently killing the connection — which
+            # left the client stuck showing "processing…" forever with no explanation.
+            try:
+                text = await loop.run_in_executor(None, transcribe, audio_bytes)
+            except Exception:
+                logging.exception("STT failed")
+                await ws.send_json({"type": "error", "message": "speech-to-text failed"})
+                continue
+
             if not text:
                 await ws.send_json({"type": "error", "message": "no speech detected"})
                 continue
 
             await ws.send_json({"type": "transcript", "text": text})
 
-            reply = await loop.run_in_executor(None, query_llm, text)
+            try:
+                reply = await loop.run_in_executor(None, query_llm, text)
+            except Exception:
+                logging.exception("LLM request failed")
+                await ws.send_json({"type": "error", "message": "couldn't reach the language model"})
+                continue
+
             await ws.send_json({"type": "reply_text", "text": reply})
 
-            wav_bytes = await loop.run_in_executor(None, synthesize, reply)
+            try:
+                wav_bytes = await loop.run_in_executor(None, synthesize, reply)
+            except Exception:
+                logging.exception("TTS failed")
+                await ws.send_json({"type": "error", "message": "text-to-speech failed"})
+                continue
+
             await ws.send_json({
                 "type": "reply_audio",
                 "audio_b64": base64.b64encode(wav_bytes).decode("ascii"),
