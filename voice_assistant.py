@@ -17,11 +17,13 @@ Then open http://<tailscale-hostname>:8000 from any device on your tailnet.
 import asyncio
 import base64
 import io
+import json
 import logging
 import re
 import subprocess
 import tempfile
 import threading
+import time
 import wave
 from pathlib import Path
 
@@ -60,6 +62,23 @@ PIPER_MODEL = "/opt/piper/en_US-lessac-medium.onnx"
 PIPER_SAMPLE_RATE = 22050   # must match your voice model's .onnx.json "sample_rate", or audio is pitched wrong
 HOST = "0.0.0.0"
 PORT = 8000
+
+# Conversation memory — how many past (user, assistant) turn pairs to send back to the LLM as
+# context on each new turn. 0 disables memory (every turn is stateless, the old behavior).
+MAX_HISTORY_TURNS = 6
+
+# Per-connection cap on processed turns per rolling 60s window. Guards against a runaway client
+# (or someone who has AUTH_TOKEN but is hammering the endpoint) burning STT/LLM/TTS resources.
+RATE_LIMIT_TURNS_PER_MINUTE = 20
+
+# Selectable personas — each maps to a system prompt. The frontend's persona dropdown sends the
+# key back via a "set_persona" message; PERSONAS[DEFAULT_PERSONA] is used until then.
+PERSONAS = {
+    "default": "You are a concise voice assistant. Keep replies short — this will be read aloud.",
+    "pirate": "You are a pirate voice assistant. Reply in short, pirate-flavored sentences — this will be read aloud.",
+    "coach": "You are an upbeat, encouraging voice coach. Keep replies short and motivating — this will be read aloud.",
+}
+DEFAULT_PERSONA = "default"
 # ----------------
 
 app = FastAPI()
@@ -70,8 +89,6 @@ llm_client = OpenAI(base_url=LLAMA_SWAP_URL, api_key="not-needed")
 # concurrent .transcribe() calls from multiple threads, and the WS handler runs each call in a
 # shared executor thread pool — serialize access rather than risk corrupted/interleaved results.
 stt_lock = threading.Lock()
-
-SYSTEM_PROMPT = "You are a concise voice assistant. Keep replies short — this will be read aloud."
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
@@ -85,6 +102,44 @@ def split_sentences(text: str) -> list[str]:
 
 def _check_auth(token: str | None) -> bool:
     return not AUTH_TOKEN or token == AUTH_TOKEN
+
+
+class ConnectionState:
+    """Per-WebSocket-connection state: which persona is active, the running conversation
+    history for that persona, and a rolling window of turn timestamps for rate limiting."""
+
+    def __init__(self):
+        self.persona = DEFAULT_PERSONA
+        self.history: list[dict] = []  # alternating user/assistant messages, no system prompt
+        self.turn_timestamps: list[float] = []
+
+    def build_messages(self, user_text: str) -> list[dict]:
+        system_prompt = PERSONAS.get(self.persona, PERSONAS[DEFAULT_PERSONA])
+        trimmed_history = self.history[-(MAX_HISTORY_TURNS * 2):] if MAX_HISTORY_TURNS else []
+        return (
+            [{"role": "system", "content": system_prompt}]
+            + trimmed_history
+            + [{"role": "user", "content": user_text}]
+        )
+
+    def record_turn(self, user_text: str, assistant_text: str) -> None:
+        self.history.append({"role": "user", "content": user_text})
+        self.history.append({"role": "assistant", "content": assistant_text})
+        self.history = self.history[-(MAX_HISTORY_TURNS * 2):]
+
+    def set_persona(self, persona: str) -> None:
+        self.persona = persona
+        self.history = []  # start the new persona with a clean slate rather than mixed context
+
+    def allow_turn(self) -> bool:
+        """Rolling 60s window rate limit. Returns False (and does not consume a slot) once
+        RATE_LIMIT_TURNS_PER_MINUTE turns have already been started in the last 60 seconds."""
+        now = time.monotonic()
+        self.turn_timestamps = [t for t in self.turn_timestamps if now - t < 60]
+        if len(self.turn_timestamps) >= RATE_LIMIT_TURNS_PER_MINUTE:
+            return False
+        self.turn_timestamps.append(now)
+        return True
 
 
 def transcribe(audio_bytes: bytes) -> str:
@@ -102,14 +157,8 @@ def transcribe(audio_bytes: bytes) -> str:
         Path(path).unlink(missing_ok=True)
 
 
-def query_llm(text: str) -> str:
-    resp = llm_client.chat.completions.create(
-        model=LLAMA_SWAP_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": text},
-        ],
-    )
+def query_llm(messages: list[dict]) -> str:
+    resp = llm_client.chat.completions.create(model=LLAMA_SWAP_MODEL, messages=messages)
     return resp.choices[0].message.content.strip()
 
 
@@ -137,61 +186,121 @@ def synthesize(text: str) -> bytes:
     return buf.getvalue()
 
 
+async def _run_turn(ws: WebSocket, state: ConnectionState, *, audio_bytes: bytes | None, user_text: str | None):
+    """Handles one full turn (STT if audio given -> LLM -> TTS), sending progress messages as
+    each stage completes. Runs as its own asyncio.Task so a new incoming message can cancel it
+    mid-flight (barge-in) — cancellation just unwinds this coroutine, nothing to clean up."""
+    loop = asyncio.get_event_loop()
+
+    # Each stage is wrapped separately so a downstream outage (LLM unreachable, piper missing, a
+    # bad model file) sends the client a specific, recoverable error message instead of raising
+    # out of the handler and silently killing the connection — which left the client stuck
+    # showing "processing…" forever with no explanation.
+    if audio_bytes is not None:
+        try:
+            user_text = await loop.run_in_executor(None, transcribe, audio_bytes)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("STT failed")
+            await ws.send_json({"type": "error", "message": "speech-to-text failed"})
+            return
+
+        if not user_text:
+            await ws.send_json({"type": "error", "message": "no speech detected"})
+            return
+
+    await ws.send_json({"type": "transcript", "text": user_text})
+
+    try:
+        messages = state.build_messages(user_text)
+        reply = await loop.run_in_executor(None, query_llm, messages)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.exception("LLM request failed")
+        await ws.send_json({"type": "error", "message": "couldn't reach the language model"})
+        return
+
+    state.record_turn(user_text, reply)
+    await ws.send_json({"type": "reply_text", "text": reply})
+
+    # Synthesize and send sentence-by-sentence rather than the whole reply at once, so playback
+    # of the first sentence can start while later sentences are still being synthesized, instead
+    # of the client waiting on piper for the entire reply.
+    try:
+        sentences = split_sentences(reply)
+        for i, sentence in enumerate(sentences):
+            wav_bytes = await loop.run_in_executor(None, synthesize, sentence)
+            await ws.send_json({
+                "type": "reply_audio",
+                "audio_b64": base64.b64encode(wav_bytes).decode("ascii"),
+                "final": i == len(sentences) - 1,
+            })
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.exception("TTS failed")
+        await ws.send_json({"type": "error", "message": "text-to-speech failed"})
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket, token: str | None = Query(None)):
     if not _check_auth(token):
         await ws.close(code=4401)
         return
     await ws.accept()
+    state = ConnectionState()
+    current_task: asyncio.Task | None = None
     try:
         while True:
-            audio_bytes = await ws.receive_bytes()
-            loop = asyncio.get_event_loop()
+            message = await ws.receive()
+            if message["type"] == "websocket.disconnect":
+                break
 
-            # Each stage is wrapped separately so a downstream outage (LLM unreachable, piper
-            # missing, a bad model file) sends the client a specific, recoverable error message
-            # instead of raising out of the handler and silently killing the connection — which
-            # left the client stuck showing "processing…" forever with no explanation.
-            try:
-                text = await loop.run_in_executor(None, transcribe, audio_bytes)
-            except Exception:
-                logging.exception("STT failed")
-                await ws.send_json({"type": "error", "message": "speech-to-text failed"})
+            audio_bytes = message.get("bytes")
+            raw_text = message.get("text")
+
+            user_text = None
+            if raw_text is not None:
+                try:
+                    payload = json.loads(raw_text)
+                except ValueError:
+                    continue
+                if payload.get("type") == "set_persona":
+                    persona = payload.get("persona")
+                    if persona in PERSONAS:
+                        state.set_persona(persona)
+                        await ws.send_json({"type": "persona_set", "persona": persona})
+                    continue
+                if payload.get("type") == "text_input":
+                    user_text = (payload.get("text") or "").strip()
+                    if not user_text:
+                        continue
+                else:
+                    continue
+            elif audio_bytes is None:
                 continue
 
-            if not text:
-                await ws.send_json({"type": "error", "message": "no speech detected"})
+            # A new utterance/message while a turn is still in flight is a barge-in: cancel the
+            # in-progress turn (stopping further server-side work and telling the client to stop
+            # any queued playback) before starting the new one.
+            if current_task is not None and not current_task.done():
+                current_task.cancel()
+                await ws.send_json({"type": "interrupted"})
+
+            if not state.allow_turn():
+                await ws.send_json({"type": "error", "message": "rate limit exceeded — slow down"})
                 continue
 
-            await ws.send_json({"type": "transcript", "text": text})
-
-            try:
-                reply = await loop.run_in_executor(None, query_llm, text)
-            except Exception:
-                logging.exception("LLM request failed")
-                await ws.send_json({"type": "error", "message": "couldn't reach the language model"})
-                continue
-
-            await ws.send_json({"type": "reply_text", "text": reply})
-
-            # Synthesize and send sentence-by-sentence rather than the whole reply at once, so
-            # playback of the first sentence can start while later sentences are still being
-            # synthesized, instead of the client waiting on piper for the entire reply.
-            try:
-                sentences = split_sentences(reply)
-                for i, sentence in enumerate(sentences):
-                    wav_bytes = await loop.run_in_executor(None, synthesize, sentence)
-                    await ws.send_json({
-                        "type": "reply_audio",
-                        "audio_b64": base64.b64encode(wav_bytes).decode("ascii"),
-                        "final": i == len(sentences) - 1,
-                    })
-            except Exception:
-                logging.exception("TTS failed")
-                await ws.send_json({"type": "error", "message": "text-to-speech failed"})
-                continue
+            current_task = asyncio.create_task(
+                _run_turn(ws, state, audio_bytes=audio_bytes, user_text=user_text)
+            )
     except WebSocketDisconnect:
         pass
+    finally:
+        if current_task is not None and not current_task.done():
+            current_task.cancel()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -282,6 +391,21 @@ async def index(token: str | None = None):
   .talk-btn.recording .icon-mic { display: none; }
   .talk-btn.recording .icon-stop { display: block; }
   .hint { font-size: 13px; color: #7d7d7d; }
+
+  .persona-select {
+    background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.14); color: #eaeaf0;
+    border-radius: 999px; padding: 6px 14px; font-size: 13px;
+  }
+  .text-input-row { display: flex; gap: 8px; width: 100%; max-width: 320px; }
+  .text-input-row input {
+    flex: 1; background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.14);
+    color: #eaeaf0; border-radius: 999px; padding: 8px 16px; font-size: 14px; min-width: 0;
+  }
+  .text-input-row input::placeholder { color: #7d7d7d; }
+  .text-input-row button {
+    border: 1px solid rgba(255,255,255,.18); background: rgba(255,255,255,.08); color: #eaeaf0;
+    border-radius: 999px; padding: 8px 16px; font-size: 14px; cursor: pointer;
+  }
 </style>
 </head>
 <body>
@@ -294,6 +418,11 @@ async def index(token: str | None = None):
   </div>
 
   <div class="controls">
+    <select class="persona-select" id="personaSelect" aria-label="Persona">
+      <option value="default" selected>Default</option>
+      <option value="pirate">Pirate</option>
+      <option value="coach">Coach</option>
+    </select>
     <div class="mode-toggle">
       <button id="modePush" class="active" aria-pressed="true">Push to talk</button>
       <button id="modeCont" aria-pressed="false">Continuous</button>
@@ -310,6 +439,10 @@ async def index(token: str | None = None):
       </svg>
     </button>
     <div class="hint" id="hint">hold to talk</div>
+    <div class="text-input-row">
+      <input type="text" id="textInput" placeholder="…or type instead" autocomplete="off" />
+      <button id="textSend" type="button">Send</button>
+    </div>
   </div>
 
   <audio id="player"></audio>
@@ -325,6 +458,9 @@ const hint = document.getElementById("hint");
 const modePushBtn = document.getElementById("modePush");
 const modeContBtn = document.getElementById("modeCont");
 const player = document.getElementById("player");
+const personaSelect = document.getElementById("personaSelect");
+const textInput = document.getElementById("textInput");
+const textSendBtn = document.getElementById("textSend");
 
 let mode = "push"; // "push" | "continuous"
 let ws, mediaRecorder, stream, chunks = [];
@@ -424,7 +560,12 @@ function connect() {
   const token = new URLSearchParams(location.search).get("token");
   const qs = token ? `?token=${encodeURIComponent(token)}` : "";
   ws = new WebSocket(`ws://${location.host}/ws${qs}`);
-  ws.onopen = () => { setStatus(mode === "push" ? "ready" : "listening…"); };
+  ws.onopen = () => {
+    setStatus(mode === "push" ? "ready" : "listening…");
+    if (personaSelect.value !== "default") {
+      ws.send(JSON.stringify({ type: "set_persona", persona: personaSelect.value }));
+    }
+  };
   ws.onclose = () => { setStatus("disconnected — reconnecting…", true); setTimeout(connect, 1500); };
   ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
@@ -440,9 +581,14 @@ function connect() {
     if (msg.type === "reply_audio") {
       enqueueAudio(msg.audio_b64, msg.final !== false);
     }
+    if (msg.type === "interrupted") {
+      // server is cancelling the in-flight turn because a new utterance/message just arrived —
+      // stop whatever's playing/queued locally so the two turns' audio don't overlap.
+      stopPlaybackQueue();
+    }
     if (msg.type === "error") {
       busy = false;
-      audioQueue = [];
+      stopPlaybackQueue();
       setStatus(msg.message, true);
       setOrb(mode === "continuous" ? "listening" : "");
     }
@@ -476,6 +622,39 @@ function playNextInQueue() {
     playNextInQueue();
   };
 }
+
+function stopPlaybackQueue() {
+  player.pause();
+  player.onended = null;
+  audioQueue = [];
+  playingQueue = false;
+  busy = false;
+}
+
+// ---- text input fallback ----
+function sendTextInput() {
+  const text = textInput.value.trim();
+  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+  if (busy) stopPlaybackQueue();
+  transcriptEl.textContent = text;
+  replyEl.textContent = "";
+  setStatus("thinking…");
+  setOrb("thinking");
+  busy = true;
+  ws.send(JSON.stringify({ type: "text_input", text }));
+  textInput.value = "";
+}
+textSendBtn.onclick = sendTextInput;
+textInput.onkeydown = (e) => {
+  if (e.key === "Enter") { e.preventDefault(); sendTextInput(); }
+};
+
+// ---- persona selection ----
+personaSelect.onchange = () => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "set_persona", persona: personaSelect.value }));
+  }
+};
 
 function micSupported() {
   return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
@@ -531,6 +710,7 @@ async function pushStart() {
   } catch {
     return;
   }
+  if (busy) stopPlaybackQueue(); // barge-in: talking again cuts off whatever's still playing
   startRecorder();
   recBtn.classList.add("recording");
   setOrb("listening");
@@ -569,21 +749,22 @@ function vadLoop() {
   for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
   const rms = Math.sqrt(sum / data.length);
 
-  if (!busy) {
-    if (rms > VOICE_THRESHOLD) {
-      if (!speaking) {
-        speaking = true;
-        startRecorder();
-        setOrb("listening");
-      }
+  if (rms > VOICE_THRESHOLD) {
+    if (!speaking) {
+      speaking = true;
+      // barge-in: voice detected while a reply is still playing/queued — cut it off and start
+      // recording the new utterance instead of waiting for playback to finish.
+      if (busy) stopPlaybackQueue();
+      startRecorder();
+      setOrb("listening");
+    }
+    silenceStart = null;
+  } else if (speaking) {
+    if (silenceStart === null) silenceStart = Date.now();
+    else if (Date.now() - silenceStart > SILENCE_MS) {
+      speaking = false;
       silenceStart = null;
-    } else if (speaking) {
-      if (silenceStart === null) silenceStart = Date.now();
-      else if (Date.now() - silenceStart > SILENCE_MS) {
-        speaking = false;
-        silenceStart = null;
-        if (mediaRecorder && mediaRecorder.state === "recording") mediaRecorder.stop();
-      }
+      if (mediaRecorder && mediaRecorder.state === "recording") mediaRecorder.stop();
     }
   }
   requestAnimationFrame(vadLoop);

@@ -35,6 +35,24 @@ Covers, all with `WhisperModel` faked out:
 - **Happy path** — a full turn with the LLM and piper mocked to succeed produces `transcript` →
   `reply_text` → `reply_audio` in order.
 - **WAV wrapping** — `synthesize()`'s raw-PCM-to-WAV framing is structurally correct.
+- **Piper process errors** — a `CalledProcessError` from piper (binary ran, exited non-zero) is
+  logged with its stderr and surfaces to the client as `{"type": "error", "message": "text-to-speech failed"}`.
+- **STT temp-file cleanup** — a failed `stt_model.transcribe()` call still removes the temp
+  `.webm` file (regression test for a leak).
+- **Multi-sentence replies** — a reply with more than one sentence produces one `reply_audio`
+  message per sentence, with `final: true` only on the last.
+- **Auth** — `AUTH_TOKEN` set: `GET /` and `/ws` reject a missing/wrong `?token=`, accept the
+  correct one.
+- **Conversation memory** — a second turn's LLM call includes the first turn's user/assistant
+  messages plus the active persona's system prompt, per `ConnectionState.build_messages()`.
+- **Text input** — a `{"type": "text_input", ...}` message skips `transcribe()` entirely and goes
+  straight to the LLM; blank text is ignored.
+- **Personas** — `set_persona` swaps the system prompt sent to the LLM and resets history; an
+  unknown persona key is ignored.
+- **Rate limiting** — exceeding `RATE_LIMIT_TURNS_PER_MINUTE` on one connection returns
+  `{"type": "error", "message": "rate limit exceeded — slow down"}` instead of processing the turn.
+- **Barge-in** — a new utterance arriving while a turn is still in flight cancels that turn,
+  sends `{"type": "interrupted"}`, and processes the new one.
 
 ## Run the real (slow) CPU integration test
 

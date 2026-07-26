@@ -41,18 +41,57 @@ on the full reply before any audio arrives.
 
 ## WebSocket message protocol
 
-**Client → server:** a single binary WebM/Opus blob per utterance (one message per turn, not a
-continuous stream). If `AUTH_TOKEN` is set, the connection URL must include `?token=<value>` or
-the server closes it (code `4401`) before accepting.
+**Client → server:**
 
-**Server → client:** JSON text messages, in this order per turn:
+| Message | Meaning |
+|---|---|
+| binary WebM/Opus blob | One utterance, transcribed via `transcribe()`. |
+| `{"type": "text_input", "text": "..."}` | Typed input — skips STT, goes straight to the LLM with the same conversation history and persona as a spoken turn. |
+| `{"type": "set_persona", "persona": "..."}` | Switches the system prompt to `PERSONAS[persona]` and clears conversation history (a persona starts with a clean slate). Unknown keys are ignored. |
+
+If `AUTH_TOKEN` is set, the connection URL must include `?token=<value>` or the server closes it
+(code `4401`) before accepting.
+
+**Server → client:** JSON text messages. For a turn (audio or text input), in this order:
 
 | Type | Fields | Meaning |
 |---|---|---|
-| `transcript` | `text` | What Whisper heard. |
+| `transcript` | `text` | What Whisper heard, or the typed text for a `text_input` turn. |
 | `reply_text` | `text` | The LLM's reply, before speech synthesis. |
 | `reply_audio` | `audio_b64`, `final` | Base64-encoded WAV of one sentence of the spoken reply; sent once per sentence. `final` is `true` on the last chunk of the turn. |
-| `error` | `message` | Something recoverable went wrong (e.g. no speech detected); the turn ends without a reply. |
+| `error` | `message` | Something recoverable went wrong (e.g. no speech detected, rate limit exceeded); the turn ends without a reply. |
+| `interrupted` | — | A new utterance or `text_input` arrived while a turn was still in flight; the previous turn was cancelled server-side and the client should stop any playback in progress (barge-in). |
+| `persona_set` | `persona` | Acknowledges a successful `set_persona`. |
+
+## Conversation memory & personas
+
+`ConnectionState` (one instance per WebSocket connection) tracks the active persona and a running
+`history` of `(user, assistant)` message pairs, trimmed to the last `MAX_HISTORY_TURNS` pairs
+(default 6; set to `0` for the old fully-stateless behavior). Each turn's LLM call is built from
+`state.build_messages(user_text)`: `[system prompt for the active persona] + trimmed history +
+[this turn's user message]`. `PERSONAS` in the config block maps a key to a system prompt;
+`set_persona` switches it and resets history, since mixing conversation context across personas
+mid-conversation would be incoherent. History and persona live only in memory for the lifetime of
+the connection — nothing is persisted, and a reconnect starts fresh.
+
+## Barge-in (interrupting a reply)
+
+Turn processing (`_run_turn`) runs as its own `asyncio.Task` rather than being awaited inline in
+the receive loop, specifically so a new incoming message can interrupt it: `ws_endpoint`'s loop
+calls `ws.receive()` continuously, and if a new audio blob or `text_input` arrives while the
+previous turn's task is still running, that task is cancelled (`current_task.cancel()`) and the
+client is told via `{"type": "interrupted"}` before the new turn starts. On the client, continuous
+mode's VAD and push-to-talk's mic button both trigger the same local cleanup (`stopPlaybackQueue()`)
+the moment new speech/typing starts, so local playback stops immediately rather than waiting for
+the server round-trip.
+
+## Rate limiting
+
+`ConnectionState.allow_turn()` implements a simple rolling 60-second window, capping each
+connection to `RATE_LIMIT_TURNS_PER_MINUTE` turns (default 20). Once exceeded, new turns get
+`{"type": "error", "message": "rate limit exceeded — slow down"}` instead of being processed. This
+is a per-connection guard against a runaway or misbehaving client, not a general abuse-prevention
+system (it resets on reconnect).
 
 ## Frontend
 
@@ -85,7 +124,9 @@ subprocess runs:
   (`finally`), including when transcription itself raises. The actual `stt_model.transcribe()`
   call is serialized with `stt_lock`, since concurrent calls into the same model instance from
   multiple executor threads aren't documented as safe by faster-whisper/ctranslate2.
-- `query_llm(text)` — a single non-streaming chat completion call against `LLAMA_SWAP_URL`.
+- `query_llm(messages)` — a single non-streaming chat completion call against `LLAMA_SWAP_URL`,
+  given the full message list built by `ConnectionState.build_messages()` (system prompt + trimmed
+  history + this turn's user message).
 - `synthesize(text)` — pipes text into the `piper` binary as a subprocess and wraps its raw PCM
   output in a WAV container at `PIPER_SAMPLE_RATE`. A `CalledProcessError` (piper ran but failed)
   is logged with piper's stderr before being re-raised, so the operator can see *why* piper failed
